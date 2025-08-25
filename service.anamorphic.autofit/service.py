@@ -2,12 +2,16 @@ import xbmc
 import xbmcaddon
 import json
 import time
+import re
+from urllib.request import urlopen, Request
+from urllib.parse import quote_plus
+from urllib.error import URLError, HTTPError
 
 class AnamorphicPlayerMonitor(xbmc.Player):
     def __init__(self):
         super(AnamorphicPlayerMonitor, self).__init__()
         self.addon = xbmcaddon.Addon()
-        self.log("Service initialized (Configurable AR).")
+        self.log("Service initialized (Regex/RPC Fix).")
 
     def log(self, msg, level=xbmc.LOGINFO):
         """Helper function for logging."""
@@ -32,6 +36,54 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             self.log(f"Failed to execute JSON-RPC {method}: {e}", level=xbmc.LOGERROR)
             return None
 
+    def _get_aspect_ratio_from_bluray_com(self, title, year):
+        """
+        Searches blu-ray.com for a given title and year, and scrapes the
+        aspect ratio from the movie's page.
+        """
+        if not title or not year:
+            self.log("Title or year is missing, cannot perform web search.")
+            return None
+
+        search_term = f"{title} {year}"
+        self.log(f"Searching online for aspect ratio of: {search_term}")
+
+        try:
+            search_url = f"https://www.blu-ray.com/search/?quicksearch=1&quicksearch_country=US&quicksearch_keyword={quote_plus(search_term)}&section=all"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
+            
+            req = Request(search_url, headers=headers)
+            with urlopen(req, timeout=10) as response:
+                search_html = response.read().decode('utf-8', errors='ignore')
+
+            match = re.search(r'<a .*?href="(https://www.blu-ray.com/movies/.+?/\d+/)"', search_html)
+            if not match:
+                self.log(f"No movie link found in search results for '{search_term}'.")
+                return None
+            
+            movie_url = match.group(1)
+            self.log(f"Found movie page link: {movie_url}")
+
+            req = Request(movie_url, headers=headers)
+            with urlopen(req, timeout=10) as response:
+                movie_html = response.read().decode('utf-8', errors='ignore')
+
+            ar_match = re.search(r'Aspect ratio:\s*(\d+\.\d{2}):1', movie_html)
+            if not ar_match:
+                self.log("Could not find 'Aspect ratio' tag on the movie page.")
+                return None
+
+            aspect_ratio = float(ar_match.group(1))
+            self.log(f"Successfully scraped aspect ratio: {aspect_ratio}")
+            return aspect_ratio
+
+        except (URLError, HTTPError, TimeoutError) as e:
+            self.log(f"Network error while scraping blu-ray.com: {e}", level=xbmc.LOGERROR)
+            return None
+        except Exception as e:
+            self.log(f"An unexpected error occurred during web scraping: {e}", level=xbmc.LOGERROR)
+            return None
+
     def onPlayBackStarted(self):
         """Called when Kodi starts playing a file."""
         xbmc.sleep(2000)
@@ -43,68 +95,83 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         if self.isPlayingVideo():
             self.log("Playback started. Analyzing video stream.")
             
-            # --- CONFIGURATION (NOW FROM SETTINGS) ---
             try:
-                # Read the target AR from the settings.xml file
                 target_ar_str = self.addon.getSetting('target_ar')
                 TARGET_SCREEN_AR = float(target_ar_str)
                 self.log(f"Using Target Screen AR from settings: {TARGET_SCREEN_AR}")
             except (ValueError, TypeError):
-                # Fallback to default if setting is invalid or empty
                 TARGET_SCREEN_AR = 2.40
                 self.log(f"Could not parse Target AR setting. Falling back to default: {TARGET_SCREEN_AR}", level=xbmc.LOGWARNING)
 
-            ANAMORPHIC_PIXEL_RATIO = (16.0 / 9.0) / TARGET_SCREEN_AR
-
             player_id = self.get_player_id()
-            if player_id is None:
-                return
+            if player_id is None: return
 
-            item_details = self.execute_json_rpc("Player.GetItem", {"playerid": player_id, "properties": ["customproperties"]})
+            item_details = self.execute_json_rpc("Player.GetItem", {"playerid": player_id, "properties": ["premiered", "customproperties"]})
             if not item_details or "item" not in item_details:
                 self.log("Could not get item details.", level=xbmc.LOGWARNING)
                 return
             
-            media_type = item_details["item"].get("customproperties", {}).get("tmdb_type")
-            # self.log(json.dumps(item_details))
-            self.log(f"Media type identified as: {media_type}")
+            item = item_details["item"]
             
-            if media_type != "movie":
-                self.log(f"Media is not a movie ('{media_type}'). No adjustments will be made.")
+            title = item.get("label")
+            custom_props = item.get("customproperties", {})
+            media_type = custom_props.get("tmdb_type")
+            
+            year = custom_props.get("premiered.year")
+            if not year:
+                premiered_date = item.get("premiered")
+                if premiered_date and len(premiered_date) >= 4:
+                    year = premiered_date[:4]
+
+            content_ar = self._get_aspect_ratio_from_bluray_com(title, year)
+            final_ar = None
+
+            if content_ar:
+                self.log(f"Using successfully scraped AR: {content_ar}")
+                final_ar = content_ar
+            else:
+                self.log("Using fallback AR logic based on media type.")
+                if media_type == 'movie':
+                    final_ar = 2.39
+                    self.log(f"Fallback for movie: Assuming AR is {final_ar}")
+                elif media_type in ['tvshow', 'episode']:
+                    final_ar = 16.0 / 9.0
+                    self.log(f"Fallback for TV Show: Assuming AR is {final_ar:.3f}")
+                else:
+                    self.log(f"Media type '{media_type}' is not recognized for fallback. No adjustments will be made.")
+
+            if not final_ar:
                 return
 
             player_props = self.execute_json_rpc("Player.GetProperties", {"playerid": player_id, "properties": ["videostreams"]})
             if player_props and player_props.get("videostreams"):
                 video_stream = player_props["videostreams"][0]
-                width = video_stream.get("width")
-                height = video_stream.get("height")
+                width, height = video_stream.get("width"), video_stream.get("height")
 
                 if not width or not height:
                     self.log("Could not determine video resolution.", level=xbmc.LOGWARNING)
                     return
 
                 video_ar = float(width) / float(height)
-                self.log(f"Video resolution: {width}x{height}, Aspect Ratio: {video_ar:.3f}")
+                self.log(f"Video resolution: {width}x{height}, Container AR: {video_ar:.3f}")
 
-                if 1.77 < video_ar < 1.79:
-                    self.log("16:9 video container detected. Applying anamorphic adjustments.")
+                if 1.77 < video_ar < 1.79 and final_ar > video_ar + 0.01:
+                    self.log("16:9 container with wider content detected. Applying anamorphic adjustments.")
                     
-                    zoom_factor = TARGET_SCREEN_AR / video_ar
+                    effective_ar = min(final_ar, TARGET_SCREEN_AR)
+                    self.log(f"Using effective AR for zoom: {effective_ar:.3f} (min of Content AR {final_ar:.3f} and Screen AR {TARGET_SCREEN_AR:.3f})")
+                    
+                    zoom_factor = effective_ar / video_ar
+                    ANAMORPHIC_PIXEL_RATIO = (16.0 / 9.0) / TARGET_SCREEN_AR
+
                     self.log(f"Calculated Zoom Factor: {zoom_factor:.3f}")
                     self.log(f"Applying Pixel Ratio: {ANAMORPHIC_PIXEL_RATIO:.4f}")
 
-                    view_mode_params = {
-                        "viewmode": {
-                            "zoom": zoom_factor,
-                            "pixelratio": ANAMORPHIC_PIXEL_RATIO
-                        }
-                    }
+                    view_mode_params = {"viewmode": {"zoom": zoom_factor, "pixelratio": ANAMORPHIC_PIXEL_RATIO}}
                     self.execute_json_rpc("Player.SetViewMode", view_mode_params)
                     self.log("Custom view mode applied successfully.")
                 else:
-                    self.log(f"Video is not 16:9 ({video_ar:.3f}). No adjustments needed.")
-            else:
-                self.log("Could not retrieve video stream details.", level=xbmc.LOGWARNING)
+                    self.log(f"No adjustment needed. Container AR: {video_ar:.3f}, Content AR: {final_ar:.3f}")
 
     def onPlayBackStopped(self):
         self.log("Playback stopped.")
