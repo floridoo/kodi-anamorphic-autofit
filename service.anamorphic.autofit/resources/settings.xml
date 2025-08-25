@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings>
+  <category label="General">
+    <setting id="enable_autofit" type="bool" label="Enable Anamorphic Auto Fit" help="Automatically zoom 16:9 movies to fit your screen." default="true"/>
+    <setting id="target_ar" type="text" label="Your Screen's Aspect Ratio" help="Enter the true aspect ratio of your screen (e.g., 2.40, 2.35). This will be used as the target for zooming." default="2.40"/>
+  </category>
+</settings>
