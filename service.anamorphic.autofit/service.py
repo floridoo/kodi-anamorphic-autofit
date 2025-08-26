@@ -11,7 +11,7 @@ class AnamorphicPlayerMonitor(xbmc.Player):
     def __init__(self):
         super(AnamorphicPlayerMonitor, self).__init__()
         self.addon = xbmcaddon.Addon()
-        self.log("Service initialized (Regex/RPC Fix).")
+        self.log("Service initialized (Final Version).")
 
     def log(self, msg, level=xbmc.LOGINFO):
         """Helper function for logging."""
@@ -86,92 +86,127 @@ class AnamorphicPlayerMonitor(xbmc.Player):
 
     def onPlayBackStarted(self):
         """Called when Kodi starts playing a file."""
-        xbmc.sleep(2000)
+        # --- MAX_RETRIES INCREASED ---
+        MAX_RETRIES = 10
+        RETRY_DELAY_MS = 500
+
+        # This loop waits for the player to be fully active.
+        player_is_ready = False
+        for attempt in range(MAX_RETRIES):
+            if self.isPlayingVideo():
+                player_is_ready = True
+                self.log(f"Player state is active on attempt {attempt + 1}. Proceeding.")
+                break
+            self.log(f"Attempt {attempt + 1}/{MAX_RETRIES}: onPlayBackStarted fired, but player is not yet active. Retrying...")
+            xbmc.sleep(RETRY_DELAY_MS)
+        
+        if not player_is_ready:
+            self.log("Player did not become active after all retries. Aborting adjustment.", level=xbmc.LOGERROR)
+            return
+
+        # MAIN LOGIC STARTS HERE
+        self.log("Playback started. Analyzing video stream.")
 
         if not self.addon.getSettingBool('enable_autofit'):
             self.log("Addon is disabled in settings. Skipping.")
             return
-
-        if self.isPlayingVideo():
-            self.log("Playback started. Analyzing video stream.")
             
-            try:
-                target_ar_str = self.addon.getSetting('target_ar')
-                TARGET_SCREEN_AR = float(target_ar_str)
-                self.log(f"Using Target Screen AR from settings: {TARGET_SCREEN_AR}")
-            except (ValueError, TypeError):
-                TARGET_SCREEN_AR = 2.40
-                self.log(f"Could not parse Target AR setting. Falling back to default: {TARGET_SCREEN_AR}", level=xbmc.LOGWARNING)
+        try:
+            target_ar_str = self.addon.getSetting('target_ar')
+            TARGET_SCREEN_AR = float(target_ar_str)
+            self.log(f"Using Target Screen AR from settings: {TARGET_SCREEN_AR}")
+        except (ValueError, TypeError):
+            TARGET_SCREEN_AR = 2.40
+            self.log(f"Could not parse Target AR setting. Falling back to default: {TARGET_SCREEN_AR}", level=xbmc.LOGWARNING)
 
-            player_id = self.get_player_id()
-            if player_id is None: return
+        player_id = self.get_player_id()
+        if player_id is None: return
 
-            item_details = self.execute_json_rpc("Player.GetItem", {"playerid": player_id, "properties": ["premiered", "customproperties"]})
-            if not item_details or "item" not in item_details:
-                self.log("Could not get item details.", level=xbmc.LOGWARNING)
-                return
-            
-            item = item_details["item"]
-            
-            title = item.get("label")
-            custom_props = item.get("customproperties", {})
-            media_type = custom_props.get("tmdb_type")
-            
-            year = custom_props.get("premiered.year")
-            if not year:
-                premiered_date = item.get("premiered")
-                if premiered_date and len(premiered_date) >= 4:
-                    year = premiered_date[:4]
-
-            content_ar = self._get_aspect_ratio_from_bluray_com(title, year)
-            final_ar = None
-
-            if content_ar:
-                self.log(f"Using successfully scraped AR: {content_ar}")
-                final_ar = content_ar
-            else:
-                self.log("Using fallback AR logic based on media type.")
-                if media_type == 'movie':
-                    final_ar = 2.39
-                    self.log(f"Fallback for movie: Assuming AR is {final_ar}")
-                elif media_type in ['tvshow', 'episode']:
-                    final_ar = 16.0 / 9.0
-                    self.log(f"Fallback for TV Show: Assuming AR is {final_ar:.3f}")
-                else:
-                    self.log(f"Media type '{media_type}' is not recognized for fallback. No adjustments will be made.")
-
-            if not final_ar:
-                return
-
+        # Second retry loop to ensure stream *details* are populated.
+        player_props = None
+        for attempt in range(MAX_RETRIES):
             player_props = self.execute_json_rpc("Player.GetProperties", {"playerid": player_id, "properties": ["videostreams"]})
             if player_props and player_props.get("videostreams"):
-                video_stream = player_props["videostreams"][0]
-                width, height = video_stream.get("width"), video_stream.get("height")
+                if player_props["videostreams"][0].get("width", 0) > 0:
+                    self.log(f"Successfully got video stream info on attempt {attempt + 1}.")
+                    break
+            self.log(f"Attempt {attempt + 1}/{MAX_RETRIES}: Video stream details not yet available. Retrying...")
+            xbmc.sleep(RETRY_DELAY_MS)
+        else:
+            self.log("Failed to get video stream details after all retries. Aborting adjustment.", level=xbmc.LOGERROR)
+            return
 
-                if not width or not height:
-                    self.log("Could not determine video resolution.", level=xbmc.LOGWARNING)
-                    return
+        item_details = self.execute_json_rpc("Player.GetItem", {"playerid": player_id, "properties": ["showtitle", "premiered", "customproperties"]})
+        if not item_details or "item" not in item_details:
+            self.log("Could not get item details.", level=xbmc.LOGWARNING)
+            return
+        
+        item = item_details["item"]
+        
+        custom_props = item.get("customproperties", {})
+        tmdb_type = custom_props.get("tmdb_type")
+        builtin_type = item.get("type")
+        final_media_type = tmdb_type or builtin_type
+        
+        if tmdb_type:
+            self.log(f"Media type determined from tmdb_type: '{final_media_type}'")
+        else:
+            self.log(f"tmdb_type not found. Using fallback item.type: '{final_media_type}'")
 
-                video_ar = float(width) / float(height)
-                self.log(f"Video resolution: {width}x{height}, Container AR: {video_ar:.3f}")
+        search_title = None
+        if final_media_type in ['tvshow', 'episode']:
+            search_title = item.get("showtitle")
+            self.log(f"Media is a TV Show/Episode. Using show title for search: '{search_title}'")
+        else:
+            search_title = item.get("label")
+            self.log(f"Media is a Movie. Using item label for search: '{search_title}'")
+        
+        year = custom_props.get("premiered.year")
+        if not year:
+            premiered_date = item.get("premiered")
+            if premiered_date and len(premiered_date) >= 4:
+                year = premiered_date[:4]
 
-                if 1.77 < video_ar < 1.79 and final_ar > video_ar + 0.01:
-                    self.log("16:9 container with wider content detected. Applying anamorphic adjustments.")
-                    
-                    effective_ar = min(final_ar, TARGET_SCREEN_AR)
-                    self.log(f"Using effective AR for zoom: {effective_ar:.3f} (min of Content AR {final_ar:.3f} and Screen AR {TARGET_SCREEN_AR:.3f})")
-                    
-                    zoom_factor = effective_ar / video_ar
-                    ANAMORPHIC_PIXEL_RATIO = (16.0 / 9.0) / TARGET_SCREEN_AR
+        content_ar = self._get_aspect_ratio_from_bluray_com(search_title, year)
+        final_ar = None
 
-                    self.log(f"Calculated Zoom Factor: {zoom_factor:.3f}")
-                    self.log(f"Applying Pixel Ratio: {ANAMORPHIC_PIXEL_RATIO:.4f}")
+        if content_ar:
+            self.log(f"Using successfully scraped AR: {content_ar}")
+            final_ar = content_ar
+        else:
+            self.log("Using fallback AR logic based on media type.")
+            if final_media_type == 'movie':
+                final_ar = 2.39
+                self.log(f"Fallback for movie: Assuming AR is {final_ar}")
+            else:
+                final_ar = 16.0 / 9.0
+                self.log(f"Fallback for TV Show (media type is '{final_media_type}'): Assuming AR is {final_ar:.3f}")
 
-                    view_mode_params = {"viewmode": {"zoom": zoom_factor, "pixelratio": ANAMORPHIC_PIXEL_RATIO}}
-                    self.execute_json_rpc("Player.SetViewMode", view_mode_params)
-                    self.log("Custom view mode applied successfully.")
-                else:
-                    self.log(f"No adjustment needed. Container AR: {video_ar:.3f}, Content AR: {final_ar:.3f}")
+        if not final_ar:
+            return
+
+        video_stream = player_props["videostreams"][0]
+        width, height = video_stream.get("width"), video_stream.get("height")
+        video_ar = float(width) / float(height)
+        self.log(f"Video resolution: {width}x{height}, Container AR: {video_ar:.3f}")
+
+        if 1.77 < video_ar < 1.79 and final_ar > video_ar + 0.01:
+            self.log("16:9 container with wider content detected. Applying anamorphic adjustments.")
+            
+            effective_ar = min(final_ar, TARGET_SCREEN_AR)
+            self.log(f"Using effective AR for zoom: {effective_ar:.3f} (min of Content AR {final_ar:.3f} and Screen AR {TARGET_SCREEN_AR:.3f})")
+            
+            zoom_factor = effective_ar / video_ar
+            ANAMORPHIC_PIXEL_RATIO = (16.0 / 9.0) / TARGET_SCREEN_AR
+
+            self.log(f"Calculated Zoom Factor: {zoom_factor:.3f}")
+            self.log(f"Applying Pixel Ratio: {ANAMORPHIC_PIXEL_RATIO:.4f}")
+
+            view_mode_params = {"viewmode": {"zoom": zoom_factor, "pixelratio": ANAMORPHIC_PIXEL_RATIO}}
+            self.execute_json_rpc("Player.SetViewMode", view_mode_params)
+            self.log("Custom view mode applied successfully.")
+        else:
+            self.log(f"No adjustment needed. Container AR: {video_ar:.3f}, Content AR: {final_ar:.3f}")
 
     def onPlayBackStopped(self):
         self.log("Playback stopped.")
