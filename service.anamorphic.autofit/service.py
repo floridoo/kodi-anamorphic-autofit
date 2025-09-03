@@ -157,6 +157,29 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         player_id = self.get_player_id()
         if player_id is None: return
 
+        # Get video stream properties first to check the container aspect ratio.
+        player_props = self.execute_json_rpc("Player.GetProperties", {"playerid": player_id, "properties": ["videostreams"]})
+        if not (player_props and player_props.get("videostreams")):
+            self.log("Could not retrieve video stream details. Aborting.", level=xbmc.LOGWARNING)
+            return
+
+        video_stream = player_props["videostreams"][0]
+        width, height = video_stream.get("width"), video_stream.get("height")
+
+        if not width or not height:
+            self.log("Video stream width or height is missing. Aborting.", level=xbmc.LOGWARNING)
+            return
+
+        video_ar = float(width) / float(height)
+        self.log(f"Video resolution: {width}x{height}, Container AR: {video_ar:.3f}")
+
+        # --- Early Exit Optimization ---
+        # If the video container is not 16:9, no adjustments will ever be needed.
+        # We can bail out now to avoid unnecessary API calls and web scraping.
+        if not (1.77 < video_ar < 1.79):
+            self.log("Video container is not 16:9. No adjustments needed. Bailing out early.")
+            return
+
         # NON-OBVIOUS CHOICE: The 'properties' array is intentionally limited.
         # Requesting default properties like "label" or "type" can cause an
         # "Invalid params" error in modern Kodi versions (like Omega). We only
@@ -203,15 +226,9 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         if not final_ar:
             return
 
-        player_props = self.execute_json_rpc("Player.GetProperties", {"playerid": player_id, "properties": ["videostreams"]})
-        video_stream = player_props["videostreams"][0]
-        width, height = video_stream.get("width"), video_stream.get("height")
-        video_ar = float(width) / float(height)
-        self.log(f"Video resolution: {width}x{height}, Container AR: {video_ar:.3f}")
-
-        # This is the main trigger condition: the video file must be 16:9, and the
-        # actual content must be wider (indicating black bars).
-        if 1.77 < video_ar < 1.79 and final_ar > video_ar + 0.01:
+        # The final trigger condition: the content's aspect ratio must be wider
+        # than the container, indicating the presence of black bars.
+        if final_ar > video_ar + 0.01:
             self.log("16:9 container with wider content detected. Applying anamorphic adjustments.")
             
             # --- CRITICAL FIX: The Smart Zoom Calculation ---
@@ -236,7 +253,7 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             self.execute_json_rpc("Player.SetViewMode", view_mode_params)
             self.log("Custom view mode applied successfully.")
         else:
-            self.log(f"No adjustment needed. Container AR: {video_ar:.3f}, Content AR: {final_ar:.3f}")
+            self.log(f"No adjustment needed. Content AR ({final_ar:.3f}) is not wider than Container AR ({video_ar:.3f}).")
 
     def onPlayBackStopped(self):
         self.log("Playback stopped.")
