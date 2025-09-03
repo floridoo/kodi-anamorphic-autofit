@@ -9,7 +9,7 @@ import json
 import time
 import re
 from urllib.request import urlopen, Request
-from urllib.parse import quote_plus
+from urllib.parse import urlencode
 from urllib.error import URLError, HTTPError
 
 class AnamorphicPlayerMonitor(xbmc.Player):
@@ -24,14 +24,14 @@ class AnamorphicPlayerMonitor(xbmc.Player):
 
     def log(self, msg, level=xbmc.LOGINFO):
         """
-A helper function for consistent and identifiable logging. All log messages
+        A helper function for consistent and identifiable logging. All log messages
         from this addon will be prefixed with '[service.anamorphic.autofit]'.
         """
         xbmc.log(f"[service.anamorphic.autofit] {msg}", level=level)
 
     def execute_json_rpc(self, method, params):
         """
-A centralized wrapper for executing Kodi's JSON-RPC commands.
+        A centralized wrapper for executing Kodi's JSON-RPC commands.
         This handles the request creation, JSON conversion, and error logging
         for all API interactions.
         """
@@ -54,62 +54,83 @@ A centralized wrapper for executing Kodi's JSON-RPC commands.
 
     def _get_aspect_ratio_from_bluray_com(self, title, year):
         """
-        Searches blu-ray.com for a given title and year, follows the first
-        search result, and scrapes the aspect ratio from the media's page.
+        Searches blu-ray.com and scrapes the aspect ratio. It uses an efficient
+        POST request and parses the JavaScript response to find the media URL.
+        It first tries with title and year, then falls back to title only.
         """
-        if not title or not year:
-            self.log("Title or year is missing, cannot perform web search.")
+        if not title:
+            self.log("Title is missing, cannot perform web search.")
             return None
 
-        search_term = f"{title} {year}"
-        self.log(f"Searching online for aspect ratio of: {search_term}")
+        # Create a list of search terms to try in order of preference.
+        search_terms = []
+        if year:
+            search_terms.append(f"{title} {year}") # Prioritize search with year for accuracy.
+        search_terms.append(title) # Always have the title-only search as a fallback.
 
-        try:
-            # quote_plus is used to safely encode the search term for a URL.
-            search_url = f"https://www.blu-ray.com/search/?quicksearch=1&quicksearch_country=US&quicksearch_keyword={quote_plus(search_term)}&section=all"
-            # A User-Agent header is crucial to mimic a real web browser,
-            # preventing the server from blocking our automated request.
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
-            
-            req = Request(search_url, headers=headers)
-            with urlopen(req, timeout=10) as response:
-                search_html = response.read().decode('utf-8', errors='ignore')
+        # A User-Agent header is crucial to mimic a real web browser,
+        # preventing the server from blocking our automated request.
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
 
-            # NON-OBVIOUS CHOICE: This regex was chosen because the class names on the
-            # search result links were unreliable. However, the URL structure itself
-            # ('/movies/.../<id>/') is very consistent. This regex finds the first
-            # full link matching that pattern, making it robust against site style changes.
-            match = re.search(r'<a .*?href="(https://www.blu-ray.com/movies/.+?/\d+/)"', search_html)
-            if not match:
-                self.log(f"No movie link found in search results for '{search_term}'.")
-                return None
-            
-            movie_url = match.group(1)
-            self.log(f"Found movie page link: {movie_url}")
+        # Loop through the search terms and return on the first success.
+        for search_term in search_terms:
+            self.log(f"Attempting online search with term: '{search_term}'")
+            try:
+                # NON-OBVIOUS CHOICE: This uses a direct POST request to the search API,
+                # which returns a small, fast, and easy-to-parse JavaScript snippet
+                # instead of a full HTML page. This is much more efficient.
+                post_url = 'https://www.blu-ray.com/search/quicksearch.php'
+                post_data = {
+                    'section': 'bluraymovies',
+                    'userid': '-1',
+                    'country': 'US',
+                    'keyword': search_term
+                }
+                # The data must be URL-encoded and then converted to bytes for the request.
+                encoded_data = urlencode(post_data).encode('utf-8')
+                
+                req = Request(post_url, data=encoded_data, headers=headers)
+                with urlopen(req, timeout=10) as response:
+                    search_response = response.read().decode('utf-8', errors='ignore')
 
-            # Now, fetch the content of the actual movie page.
-            req = Request(movie_url, headers=headers)
-            with urlopen(req, timeout=10) as response:
-                movie_html = response.read().decode('utf-8', errors='ignore')
+                # NON-OBVIOUS CHOICE: We parse the raw JavaScript to find the first URL
+                # in the 'urls' array. This is more robust than parsing HTML tags.
+                # It looks for `var urls = new Array('...url...')` and captures the URL.
+                match = re.search(r"var urls = new Array\('([^']+)'", search_response)
+                if not match:
+                    self.log(f"Could not parse JS URL array for search term: '{search_term}'. Continuing...")
+                    continue # Try the next search term.
+                
+                movie_url = match.group(1)
+                self.log(f"Found movie page link from JS response: {movie_url}")
 
-            # This regex specifically looks for the "Aspect ratio: X.XX:1" text on the page.
-            ar_match = re.search(r'Aspect ratio:\s*(\d+\.\d{2}):1', movie_html)
-            if not ar_match:
-                self.log("Could not find 'Aspect ratio' tag on the movie page.")
-                return None
+                # Now, fetch the content of the actual movie page.
+                req = Request(movie_url, headers=headers)
+                with urlopen(req, timeout=10) as response:
+                    movie_html = response.read().decode('utf-8', errors='ignore')
 
-            aspect_ratio = float(ar_match.group(1))
-            self.log(f"Successfully scraped aspect ratio: {aspect_ratio}")
-            return aspect_ratio
+                # This regex specifically looks for the "Aspect ratio: X.XX:1" text on the page.
+                ar_match = re.search(r'Aspect ratio:\s*(\d+\.\d{2}):1', movie_html)
+                if not ar_match:
+                    self.log(f"Could not find 'Aspect ratio' tag for search term: '{search_term}'. Continuing...")
+                    continue # Try the next search term.
 
-        # This broad error handling ensures that any network failure (timeout,
-        # server error, etc.) will be caught gracefully and will not crash the addon.
-        except (URLError, HTTPError, TimeoutError) as e:
-            self.log(f"Network error while scraping blu-ray.com: {e}", level=xbmc.LOGERROR)
-            return None
-        except Exception as e:
-            self.log(f"An unexpected error occurred during web scraping: {e}", level=xbmc.LOGERROR)
-            return None
+                aspect_ratio = float(ar_match.group(1))
+                self.log(f"Successfully scraped aspect ratio: {aspect_ratio}")
+                return aspect_ratio # Success! Exit the function with the result.
+
+            # This broad error handling ensures that any network failure (timeout,
+            # server error, etc.) will be caught gracefully and will not crash the addon.
+            except (URLError, HTTPError, TimeoutError) as e:
+                self.log(f"Network error while searching for '{search_term}': {e}", level=xbmc.LOGERROR)
+                continue # Try the next search term.
+            except Exception as e:
+                self.log(f"An unexpected error occurred during web scraping for '{search_term}': {e}", level=xbmc.LOGERROR)
+                continue # Try the next search term.
+        
+        # If the loop completes without returning, all attempts have failed.
+        self.log("All search attempts failed to find an aspect ratio.")
+        return None
 
     def onPlayBackStarted(self):
         """
