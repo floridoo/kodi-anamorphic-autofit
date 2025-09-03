@@ -131,37 +131,16 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         # If the loop completes without returning, all attempts have failed.
         self.log("All search attempts failed to find an aspect ratio.")
         return None
-
-    def onPlayBackStarted(self):
+    
+    def onAVStarted(self):
         """
-        The main logic function, triggered when Kodi reports that playback has started.
+        The main logic function.
+        NON-OBVIOUS CHOICE: This is triggered by onAVStarted, not onPlayBackStarted.
+        onAVStarted fires when the first video frame is rendered, which guarantees
+        that the player is fully initialized and video stream details are available.
+        This completely eliminates timing issues and the need for unreliable retry loops.
         """
-        # NON-OBVIOUS CHOICE: We increased this from 5 to 10 based on real-world
-        # feedback that on some systems, the player can take a few seconds to
-        # fully initialize. This provides a generous window for it to become ready.
-        MAX_RETRIES = 10
-        RETRY_DELAY_MS = 500
-
-        # --- CRITICAL FIX: The `isPlayingVideo()` Retry Loop ---
-        # NON-OBVIOUS CHOICE: The onPlayBackStarted event can fire milliseconds
-        # *before* Kodi's internal player state is set to "playing". A simple check
-        # would fail intermittently. This loop actively polls the player state,
-        # making the addon timing-independent and far more reliable.
-        player_is_ready = False
-        for attempt in range(MAX_RETRIES):
-            if self.isPlayingVideo():
-                player_is_ready = True
-                self.log(f"Player state is active on attempt {attempt + 1}. Proceeding.")
-                break
-            self.log(f"Attempt {attempt + 1}/{MAX_RETRIES}: Player is not yet active. Retrying...")
-            xbmc.sleep(RETRY_DELAY_MS)
-        
-        if not player_is_ready:
-            self.log("Player did not become active after all retries. Aborting adjustment.", level=xbmc.LOGERROR)
-            return
-
-        # --- Main logic starts now that we know the player is fully active ---
-        self.log("Playback started. Analyzing video stream.")
+        self.log("onAVStarted event triggered. Analyzing video stream.")
 
         if not self.addon.getSettingBool('enable_autofit'):
             self.log("Addon is disabled in settings. Skipping.")
@@ -178,23 +157,6 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         player_id = self.get_player_id()
         if player_id is None: return
 
-        # --- Second Retry Loop for Stream Details ---
-        # This provides a second layer of defense. Even if the player is "active",
-        # the detailed stream properties (like resolution) might take a few more
-        # moments to become available. This loop waits for that specific data.
-        player_props = None
-        for attempt in range(MAX_RETRIES):
-            player_props = self.execute_json_rpc("Player.GetProperties", {"playerid": player_id, "properties": ["videostreams"]})
-            if player_props and player_props.get("videostreams"):
-                if player_props["videostreams"][0].get("width", 0) > 0:
-                    self.log(f"Successfully got video stream info on attempt {attempt + 1}.")
-                    break
-            self.log(f"Attempt {attempt + 1}/{MAX_RETRIES}: Video stream details not yet available. Retrying...")
-            xbmc.sleep(RETRY_DELAY_MS)
-        else: # This 'else' belongs to the 'for' loop and runs if it completes without a 'break'.
-            self.log("Failed to get video stream details after all retries. Aborting adjustment.", level=xbmc.LOGERROR)
-            return
-
         # NON-OBVIOUS CHOICE: The 'properties' array is intentionally limited.
         # Requesting default properties like "label" or "type" can cause an
         # "Invalid params" error in modern Kodi versions (like Omega). We only
@@ -205,31 +167,17 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             return
         
         item = item_details["item"]
-        
-        # --- Hierarchical Media Type Determination ---
-        # NON-OBVIOUS CHOICE: This logic provides the best of both worlds. It
-        # prioritizes the specific `tmdb_type` if available (from a scraper),
-        # but gracefully falls back to Kodi's built-in `item.type` if the
-        # custom property doesn't exist, which is common for TV shows.
-        custom_props = item.get("customproperties", {})
-        tmdb_type = custom_props.get("tmdb_type")
-        builtin_type = item.get("type") # e.g., 'movie', 'episode'
-        final_media_type = tmdb_type or builtin_type # Python idiom for "use the first one that isn't None"
-        
-        if tmdb_type:
-            self.log(f"Media type determined from tmdb_type: '{final_media_type}'")
-        else:
-            self.log(f"tmdb_type not found. Using fallback item.type: '{final_media_type}'")
+        # self.log(json.dumps(item)) # Log the full item details for debugging.
 
-        # Based on the determined type, we choose the correct title for searching.
-        search_title = None
-        if final_media_type in ['tvshow', 'episode']:
-            search_title = item.get("showtitle") # The name of the whole series.
-            self.log(f"Media is a TV Show/Episode. Using show title for search: '{search_title}'")
-        else: # Default to movie logic.
-            search_title = item.get("label") # The name of the movie.
-            self.log(f"Media is a Movie. Using item label for search: '{search_title}'")
-        
+        custom_props = item.get("customproperties", {})
+
+        # --- Simplified & Robust Media Type / Title Determination ---
+        # NON-OBVIOUS CHOICE: This logic is very robust. It checks for the presence of
+        # 'showtitle' or a custom 'tvshow.originaltitle' to identify a TV show.
+        # The search title then uses a hierarchy of the most reliable tags first.
+        is_tv_show = bool(item.get("showtitle") or custom_props.get("tvshow.originaltitle"))
+        search_title = item.get("showtitle") or custom_props.get("tvshow.originaltitle") or item.get("label")
+
         # Robustly get the year from multiple possible sources.
         year = custom_props.get("premiered.year")
         if not year:
@@ -245,16 +193,17 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             final_ar = content_ar
         else:
             self.log("Using fallback AR logic based on media type.")
-            if final_media_type == 'movie':
-                final_ar = 2.39
-                self.log(f"Fallback for movie: Assuming AR is {final_ar}")
-            else: # Covers 'episode', 'tvshow', and None
+            if is_tv_show:
                 final_ar = 16.0 / 9.0 # 1.777...
-                self.log(f"Fallback for TV Show (media type is '{final_media_type}'): Assuming AR is {final_ar:.3f}")
+                self.log(f"Fallback for TV Show: Assuming AR is {final_ar:.3f}")
+            else: # It's a movie
+                final_ar = 2.39
+                self.log(f"Fallback for Movie: Assuming AR is {final_ar}")
 
         if not final_ar:
             return
 
+        player_props = self.execute_json_rpc("Player.GetProperties", {"playerid": player_id, "properties": ["videostreams"]})
         video_stream = player_props["videostreams"][0]
         width, height = video_stream.get("width"), video_stream.get("height")
         video_ar = float(width) / float(height)
