@@ -190,7 +190,6 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             return
         
         item = item_details["item"]
-        # self.log(json.dumps(item)) # Log the full item details for debugging.
 
         custom_props = item.get("customproperties", {})
 
@@ -198,7 +197,6 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         # NON-OBVIOUS CHOICE: This logic is very robust. It checks for the presence of
         # 'showtitle' or a custom 'tvshow.originaltitle' to identify a TV show.
         # The search title then uses a hierarchy of the most reliable tags first.
-        is_tv_show = bool(item.get("showtitle") or custom_props.get("tvshow.originaltitle"))
         search_title = item.get("showtitle") or custom_props.get("tvshow.originaltitle") or item.get("label")
 
         # Robustly get the year from multiple possible sources.
@@ -208,22 +206,12 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             if premiered_date and len(premiered_date) >= 4:
                 year = premiered_date[:4]
 
-        content_ar = self._get_aspect_ratio_from_bluray_com(search_title, year)
-        final_ar = None
+        # Scrape the web for the true aspect ratio.
+        final_ar = self._get_aspect_ratio_from_bluray_com(search_title, year)
 
-        if content_ar:
-            self.log(f"Using successfully scraped AR: {content_ar}")
-            final_ar = content_ar
-        else:
-            self.log("Using fallback AR logic based on media type.")
-            if is_tv_show:
-                final_ar = 16.0 / 9.0 # 1.777...
-                self.log(f"Fallback for TV Show: Assuming AR is {final_ar:.3f}")
-            else: # It's a movie
-                final_ar = 2.39
-                self.log(f"Fallback for Movie: Assuming AR is {final_ar}")
-
+        # If scraping fails (final_ar is None), bail out. No fallback is used.
         if not final_ar:
+            self.log("Could not scrape aspect ratio, and no fallback is configured. No adjustments will be made.")
             return
 
         # The final trigger condition: the content's aspect ratio must be wider
