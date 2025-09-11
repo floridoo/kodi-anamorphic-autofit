@@ -20,7 +20,7 @@ class AnamorphicPlayerMonitor(xbmc.Player):
     def __init__(self):
         super(AnamorphicPlayerMonitor, self).__init__()
         self.addon = xbmcaddon.Addon()
-        self.log("Service initialized (Final Version with Comments).")
+        self.log("Service initialized")
 
     def log(self, msg, level=xbmc.LOGINFO):
         """
@@ -55,81 +55,71 @@ class AnamorphicPlayerMonitor(xbmc.Player):
     def _get_aspect_ratio_from_bluray_com(self, title, year):
         """
         Searches blu-ray.com and scrapes the aspect ratio. It uses an efficient
-        POST request and parses the JavaScript response to find the media URL.
-        It first tries with title and year, then falls back to title only.
+        POST request and requires both a title and a year for accuracy.
         """
-        if not title:
-            self.log("Title is missing, cannot perform web search.")
+        if not title or not year:
+            self.log("Title or year is missing. Bailing out of web search for accuracy.", level=xbmc.LOGWARNING)
             return None
 
-        # Create a list of search terms to try in order of preference.
-        search_terms = []
-        if year:
-            search_terms.append(f"{title} {year}") # Prioritize search with year for accuracy.
-        search_terms.append(title) # Always have the title-only search as a fallback.
+        search_term = f"{title} {year}"
 
         # A User-Agent header is crucial to mimic a real web browser,
         # preventing the server from blocking our automated request.
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
 
-        # Loop through the search terms and return on the first success.
-        for search_term in search_terms:
-            self.log(f"Attempting online search with term: '{search_term}'")
-            try:
-                # NON-OBVIOUS CHOICE: This uses a direct POST request to the search API,
-                # which returns a small, fast, and easy-to-parse JavaScript snippet
-                # instead of a full HTML page. This is much more efficient.
-                post_url = 'https://www.blu-ray.com/search/quicksearch.php'
-                post_data = {
-                    'section': 'bluraymovies',
-                    'userid': '-1',
-                    'country': 'US',
-                    'keyword': search_term
-                }
-                # The data must be URL-encoded and then converted to bytes for the request.
-                encoded_data = urlencode(post_data).encode('utf-8')
-                
-                req = Request(post_url, data=encoded_data, headers=headers)
-                with urlopen(req, timeout=10) as response:
-                    search_response = response.read().decode('utf-8', errors='ignore')
+        self.log(f"Attempting online search with term: '{search_term}'")
+        try:
+            # NON-OBVIOUS CHOICE: This uses a direct POST request to the search API,
+            # which returns a small, fast, and easy-to-parse JavaScript snippet
+            # instead of a full HTML page. This is much more efficient.
+            post_url = 'https://www.blu-ray.com/search/quicksearch.php'
+            post_data = {
+                'section': 'bluraymovies',
+                'userid': '-1',
+                'country': 'US',
+                'keyword': search_term
+            }
+            # The data must be URL-encoded and then converted to bytes for the request.
+            encoded_data = urlencode(post_data).encode('utf-8')
+            
+            req = Request(post_url, data=encoded_data, headers=headers)
+            with urlopen(req, timeout=10) as response:
+                search_response = response.read().decode('utf-8', errors='ignore')
 
-                # NON-OBVIOUS CHOICE: We parse the raw JavaScript to find the first URL
-                # in the 'urls' array. This is more robust than parsing HTML tags.
-                # It looks for `var urls = new Array('...url...')` and captures the URL.
-                match = re.search(r"var urls = new Array\('([^']+)'", search_response)
-                if not match:
-                    self.log(f"Could not parse JS URL array for search term: '{search_term}'. Continuing...")
-                    continue # Try the next search term.
-                
-                movie_url = match.group(1)
-                self.log(f"Found movie page link from JS response: {movie_url}")
+            # NON-OBVIOUS CHOICE: We parse the raw JavaScript to find the first URL
+            # in the 'urls' array. This is more robust than parsing HTML tags.
+            # It looks for `var urls = new Array('...url...')` and captures the URL.
+            match = re.search(r"var urls = new Array\('([^']+)'", search_response)
+            if not match:
+                self.log(f"Could not parse JS URL array for search term: '{search_term}'.")
+                return None
+            
+            movie_url = match.group(1)
+            self.log(f"Found movie page link from JS response: {movie_url}")
 
-                # Now, fetch the content of the actual movie page.
-                req = Request(movie_url, headers=headers)
-                with urlopen(req, timeout=10) as response:
-                    movie_html = response.read().decode('utf-8', errors='ignore')
+            # Now, fetch the content of the actual movie page.
+            req = Request(movie_url, headers=headers)
+            with urlopen(req, timeout=10) as response:
+                movie_html = response.read().decode('utf-8', errors='ignore')
 
-                # This regex specifically looks for the "Aspect ratio: X.XX:1" text on the page.
-                ar_match = re.search(r'Aspect ratio:\s*(\d+\.\d{2}):1', movie_html)
-                if not ar_match:
-                    self.log(f"Could not find 'Aspect ratio' tag for search term: '{search_term}'. Continuing...")
-                    continue # Try the next search term.
+            # This regex specifically looks for the "Aspect ratio: X.XX:1" text on the page.
+            ar_match = re.search(r'Aspect ratio:\s*(\d+\.\d{2}):1', movie_html)
+            if not ar_match:
+                self.log(f"Could not find 'Aspect ratio' tag for search term: '{search_term}'.")
+                return None
 
-                aspect_ratio = float(ar_match.group(1))
-                self.log(f"Successfully scraped aspect ratio: {aspect_ratio}")
-                return aspect_ratio # Success! Exit the function with the result.
+            aspect_ratio = float(ar_match.group(1))
+            self.log(f"Successfully scraped aspect ratio: {aspect_ratio}")
+            return aspect_ratio # Success! Exit the function with the result.
 
-            # This broad error handling ensures that any network failure (timeout,
-            # server error, etc.) will be caught gracefully and will not crash the addon.
-            except (URLError, HTTPError, TimeoutError) as e:
-                self.log(f"Network error while searching for '{search_term}': {e}", level=xbmc.LOGERROR)
-                continue # Try the next search term.
-            except Exception as e:
-                self.log(f"An unexpected error occurred during web scraping for '{search_term}': {e}", level=xbmc.LOGERROR)
-                continue # Try the next search term.
+        # This broad error handling ensures that any network failure (timeout,
+        # server error, etc.) will be caught gracefully and will not crash the addon.
+        except (URLError, HTTPError, TimeoutError) as e:
+            self.log(f"Network error while searching for '{search_term}': {e}", level=xbmc.LOGERROR)
+        except Exception as e:
+            self.log(f"An unexpected error occurred during web scraping for '{search_term}': {e}", level=xbmc.LOGERROR)
         
-        # If the loop completes without returning, all attempts have failed.
-        self.log("All search attempts failed to find an aspect ratio.")
+        self.log(f"Search attempt failed for '{search_term}'.")
         return None
     
     def onAVStarted(self):
@@ -154,10 +144,20 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             TARGET_SCREEN_AR = 2.40
             self.log(f"Could not parse Target AR setting. Falling back to default: {TARGET_SCREEN_AR}", level=xbmc.LOGWARNING)
 
+        # --- UNIVERSAL METADATA LOGIC (InfoLabels) ---
+        # NON-OBVIOUS CHOICE: This is the most robust method. We read the same InfoLabels
+        # that the skin uses. By the time onAVStarted fires, Kodi's player state has
+        # been updated by any running metadata addons, making this data accurate.
+        is_tv_show = bool(xbmc.getInfoLabel('VideoPlayer.TVShowTitle'))
+        search_title = xbmc.getInfoLabel('VideoPlayer.TVShowTitle') or xbmc.getInfoLabel('Player.Title')
+        year = xbmc.getInfoLabel('VideoPlayer.Year')
+
+        self.log(f"Media identified via InfoLabels: Title='{search_title}', Year='{year}', IsTVShow={is_tv_show}")
+        
         player_id = self.get_player_id()
         if player_id is None: return
 
-        # Get video stream properties first to check the container aspect ratio.
+        # Get video stream properties to check the container aspect ratio.
         player_props = self.execute_json_rpc("Player.GetProperties", {"playerid": player_id, "properties": ["videostreams"]})
         if not (player_props and player_props.get("videostreams")):
             self.log("Could not retrieve video stream details. Aborting.", level=xbmc.LOGWARNING)
@@ -174,59 +174,24 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         self.log(f"Video resolution: {width}x{height}, Container AR: {video_ar:.3f}")
 
         # --- Early Exit Optimization ---
-        # If the video container is not 16:9, no adjustments will ever be needed.
-        # We can bail out now to avoid unnecessary API calls and web scraping.
         if not (1.77 < video_ar < 1.79):
             self.log("Video container is not 16:9. No adjustments needed. Bailing out early.")
             return
 
-        # NON-OBVIOUS CHOICE: The 'properties' array is intentionally limited.
-        # Requesting default properties like "label" or "type" can cause an
-        # "Invalid params" error in modern Kodi versions (like Omega). We only
-        # request the non-default properties we absolutely need.
-        item_details = self.execute_json_rpc("Player.GetItem", {"playerid": player_id, "properties": ["showtitle", "premiered", "customproperties"]})
-        if not item_details or "item" not in item_details:
-            self.log("Could not get item details.", level=xbmc.LOGWARNING)
-            return
-        
-        item = item_details["item"]
+        content_ar = self._get_aspect_ratio_from_bluray_com(search_title, year)
 
-        custom_props = item.get("customproperties", {})
-
-        # --- Simplified & Robust Media Type / Title Determination ---
-        # NON-OBVIOUS CHOICE: This logic is very robust. It checks for the presence of
-        # 'showtitle' or a custom 'tvshow.originaltitle' to identify a TV show.
-        # The search title then uses a hierarchy of the most reliable tags first.
-        search_title = item.get("showtitle") or custom_props.get("tvshow.originaltitle") or item.get("label")
-
-        # Robustly get the year from multiple possible sources.
-        year = custom_props.get("premiered.year")
-        if not year:
-            premiered_date = item.get("premiered")
-            if premiered_date and len(premiered_date) >= 4:
-                year = premiered_date[:4]
-
-        # Scrape the web for the true aspect ratio.
-        final_ar = self._get_aspect_ratio_from_bluray_com(search_title, year)
-
-        # If scraping fails (final_ar is None), bail out. No fallback is used.
-        if not final_ar:
+        # If scraping fails, bail out. No fallback is used.
+        if not content_ar:
             self.log("Could not scrape aspect ratio, and no fallback is configured. No adjustments will be made.")
             return
 
-        # The final trigger condition: the content's aspect ratio must be wider
-        # than the container, indicating the presence of black bars.
-        if final_ar > video_ar + 0.01:
+        # The final trigger condition.
+        if content_ar > video_ar + 0.01:
             self.log("16:9 container with wider content detected. Applying anamorphic adjustments.")
             
             # --- CRITICAL FIX: The Smart Zoom Calculation ---
-            # NON-OBVIOUS CHOICE: This is the core of the smart zoom. We use the
-            # smaller of the two values (the movie's AR vs. your screen's AR).
-            # This prevents two problems:
-            # 1. Cropping the sides off a movie that is WIDER than your screen.
-            # 2. Over-zooming a movie that is NARROWER than your screen, cropping the top/bottom.
-            effective_ar = min(final_ar, TARGET_SCREEN_AR)
-            self.log(f"Using effective AR for zoom: {effective_ar:.3f} (min of Content AR {final_ar:.3f} and Screen AR {TARGET_SCREEN_AR:.3f})")
+            effective_ar = min(content_ar, TARGET_SCREEN_AR)
+            self.log(f"Using effective AR for zoom: {effective_ar:.3f} (min of Content AR {content_ar:.3f} and Screen AR {TARGET_SCREEN_AR:.3f})")
             
             zoom_factor = effective_ar / video_ar
             ANAMORPHIC_PIXEL_RATIO = (16.0 / 9.0) / TARGET_SCREEN_AR
@@ -234,19 +199,14 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             self.log(f"Calculated Zoom Factor: {zoom_factor:.3f}")
             self.log(f"Applying Pixel Ratio: {ANAMORPHIC_PIXEL_RATIO:.4f}")
 
-            # NON-OBVIOUS CHOICE: For Kodi Omega and later, SetViewMode takes a
-            # single parameter: a dictionary named 'viewmode'. It no longer accepts
-            # a playerid, as it acts on the active player implicitly.
             view_mode_params = {"viewmode": {"zoom": zoom_factor, "pixelratio": ANAMORPHIC_PIXEL_RATIO}}
             self.execute_json_rpc("Player.SetViewMode", view_mode_params)
             self.log("Custom view mode applied successfully.")
         else:
-            self.log(f"No adjustment needed. Content AR ({final_ar:.3f}) is not wider than Container AR ({video_ar:.3f}).")
+            self.log(f"No adjustment needed. Content AR ({content_ar:.3f}) is not wider than Container AR ({video_ar:.3f}).")
 
     def onPlayBackStopped(self):
         self.log("Playback stopped.")
-        # No action is needed here because the new SetViewMode method only
-        # affects the current playback session and doesn't change global settings.
         pass
 
     def onPlayBackEnded(self):
@@ -263,11 +223,13 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         return None
 
 if __name__ == '__main__':
-    monitor = xbmc.Monitor()
     player_monitor = AnamorphicPlayerMonitor()
-    player_monitor.log("Service started and waiting for playback.")
-
-    # A monitor loop is required for a service addon to keep it running.
+    
+    # The monitor loop's only job is to keep the addon running.
+    # All logic is now handled by the event-driven Player class.
+    monitor = xbmc.Monitor()
     while not monitor.abortRequested():
         if monitor.waitForAbort(10):
             break
+            
+    del player_monitor
