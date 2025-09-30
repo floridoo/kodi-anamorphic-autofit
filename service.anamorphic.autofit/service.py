@@ -8,9 +8,7 @@ import xbmcaddon
 import json
 import time
 import re
-from urllib.request import urlopen, Request
-from urllib.parse import urlencode
-from urllib.error import URLError, HTTPError
+import requests
 
 class AnamorphicPlayerMonitor(xbmc.Player):
     """
@@ -20,6 +18,7 @@ class AnamorphicPlayerMonitor(xbmc.Player):
     def __init__(self):
         super(AnamorphicPlayerMonitor, self).__init__()
         self.addon = xbmcaddon.Addon()
+        self.session = requests.Session()
         self.log("Service initialized")
 
     def log(self, msg, level=xbmc.LOGINFO):
@@ -66,6 +65,7 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         # A User-Agent header is crucial to mimic a real web browser,
         # preventing the server from blocking our automated request.
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15'}
+        self.session.headers.update(headers)
 
         self.log(f"Attempting online search with term: '{search_term}'")
         try:
@@ -79,12 +79,9 @@ class AnamorphicPlayerMonitor(xbmc.Player):
                 'country': 'US',
                 'keyword': search_term
             }
-            # The data must be URL-encoded and then converted to bytes for the request.
-            encoded_data = urlencode(post_data).encode('utf-8')
-            
-            req = Request(post_url, data=encoded_data, headers=headers)
-            with urlopen(req, timeout=10) as response:
-                search_response = response.read().decode('utf-8', errors='ignore')
+            response = self.session.post(post_url, data=post_data, timeout=10)
+            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+            search_response = response.text
 
             # NON-OBVIOUS CHOICE: We parse the raw JavaScript to find the first URL
             # in the 'urls' array. This is more robust than parsing HTML tags.
@@ -98,9 +95,9 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             self.log(f"Found movie page link from JS response: {movie_url}")
 
             # Now, fetch the content of the actual movie page.
-            req = Request(movie_url, headers=headers)
-            with urlopen(req, timeout=10) as response:
-                movie_html = response.read().decode('utf-8', errors='ignore')
+            response = self.session.get(movie_url, timeout=10)
+            response.raise_for_status()
+            movie_html = response.text
 
             # This regex specifically looks for the "Aspect ratio: X.XX:1" text on the page.
             ar_match = re.search(r'Aspect ratio:\s*(\d+\.\d{2}):1', movie_html)
@@ -112,10 +109,8 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             self.log(f"Successfully scraped aspect ratio: {aspect_ratio}")
             return aspect_ratio # Success! Exit the function with the result.
 
-        # This broad error handling ensures that any network failure (timeout,
-        # server error, etc.) will be caught gracefully and will not crash the addon.
-        except (URLError, HTTPError, TimeoutError) as e:
-            self.log(f"Network error while searching for '{search_term}': {e}", level=xbmc.LOGERROR)
+        except requests.exceptions.RequestException as e:
+            self.log(f"A network error occurred during web scraping for '{search_term}': {e}", level=xbmc.LOGERROR)
         except Exception as e:
             self.log(f"An unexpected error occurred during web scraping for '{search_term}': {e}", level=xbmc.LOGERROR)
         

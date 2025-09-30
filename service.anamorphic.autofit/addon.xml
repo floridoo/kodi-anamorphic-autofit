@@ -2,6 +2,7 @@
 <addon id="service.anamorphic.autofit" name="Anamorphic Auto Fit" version="1.0.0" provider-name="floridoo">
   <requires>
     <import addon="xbmc.python" version="3.0.0"/>
+    <import addon="script.module.requests" />
   </requires>
   <extension point="xbmc.python.script" library="service.py"/>
   <extension point="xbmc.service" start="startup"/>
