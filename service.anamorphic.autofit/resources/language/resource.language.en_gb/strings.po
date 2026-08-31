@@ -1,0 +1,27 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: service.anamorphic.autofit\n"
+"Language: en_GB\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgctxt "#32001"
+msgid "General"
+msgstr ""
+
+msgctxt "#32002"
+msgid "Enable Anamorphic Auto Fit"
+msgstr ""
+
+msgctxt "#32003"
+msgid "Automatically zoom suitable 16:9 video to fit your screen."
+msgstr ""
+
+msgctxt "#32004"
+msgid "Your Screen's Aspect Ratio"
+msgstr ""
+
+msgctxt "#32005"
+msgid "Enter a value from 1.78 to 4.00, for example 2.40. Invalid values use 2.40."
+msgstr ""
