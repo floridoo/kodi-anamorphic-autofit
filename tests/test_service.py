@@ -1,8 +1,10 @@
 import os
+import queue
 import sys
 import threading
 import types
 import unittest
+from unittest.mock import Mock
 
 
 ADDON_DIR = os.path.abspath(
@@ -40,6 +42,8 @@ class ServiceHelperTests(unittest.TestCase):
         monitor = object.__new__(AnamorphicPlayerMonitor)
         monitor._state_lock = threading.RLock()
         monitor._last_applied_view_mode = None
+        monitor._current_identity = None
+        monitor._result_queue = queue.Queue()
         monitor.log = lambda *args, **kwargs: None
         return monitor
 
@@ -90,6 +94,103 @@ class ServiceHelperTests(unittest.TestCase):
 
         self.assertEqual([method for method, _params in calls], ["Player.GetViewMode"])
         self.assertIsNone(monitor._last_applied_view_mode)
+
+    def test_reads_stable_l5_aspect_ratio(self):
+        monitor = self.make_monitor()
+        monitor.L5_SAMPLE_INTERVAL = 0
+        labels = {
+            monitor.L5_HAS_LABEL: "1",
+            monitor.L5_OFFSET_LABELS[0]: "0",
+            monitor.L5_OFFSET_LABELS[1]: "0",
+            monitor.L5_OFFSET_LABELS[2]: "280",
+            monitor.L5_OFFSET_LABELS[3]: "280",
+        }
+        monitor._get_info_label = lambda label: labels.get(label, "")
+
+        result = monitor._read_l5_content_ar(3840, 2160)
+
+        self.assertEqual(result[0], (0, 0, 280, 280))
+        self.assertAlmostEqual(result[1], 2.40)
+
+    def test_rejects_unstable_l5_aspect_ratio(self):
+        monitor = self.make_monitor()
+        monitor.L5_SAMPLE_INTERVAL = 0
+        samples = [
+            {"top": "280", "bottom": "280"},
+            {"top": "276", "bottom": "276"},
+            {"top": "280", "bottom": "280"},
+        ]
+        sample_index = [0]
+
+        def get_label(label):
+            sample = samples[sample_index[0]]
+            if label == monitor.L5_HAS_LABEL:
+                return "1"
+            if label == monitor.L5_OFFSET_LABELS[0] or label == monitor.L5_OFFSET_LABELS[1]:
+                value = "0"
+            elif label == monitor.L5_OFFSET_LABELS[2]:
+                value = sample["top"]
+            else:
+                value = sample["bottom"]
+                sample_index[0] += 1
+            return value
+
+        monitor._get_info_label = get_label
+
+        self.assertIsNone(monitor._read_l5_content_ar(3840, 2160))
+
+    def test_uses_l5_without_title_or_year(self):
+        monitor = self.make_monitor()
+
+        class FakeAddon:
+            def getSettingBool(self, name):
+                return name == "enable_autofit"
+
+        monitor.addon = FakeAddon()
+        monitor.get_player_id = lambda: 1
+        monitor._get_media_metadata = lambda: ("", "", False)
+        monitor._make_identity = lambda player_id, title, year: (player_id, "file", title, year)
+        monitor._reset_last_applied_view_mode = lambda player_id: None
+        monitor._read_l5_content_ar = lambda width, height: (
+            (0, 0, 280, 280),
+            2.40,
+        )
+        monitor.execute_json_rpc = lambda method, params: {
+            "currentvideostream": {"index": 0},
+            "videostreams": [{"index": 0, "width": 3840, "height": 2160}],
+        }
+        monitor._submit_lookup = Mock()
+
+        monitor._handle_av_started()
+
+        request, content_ar = monitor._result_queue.get_nowait()
+        self.assertEqual(request["aspect_source"], monitor.L5_ASPECT_SOURCE)
+        self.assertAlmostEqual(content_ar, 2.40)
+        monitor._submit_lookup.assert_not_called()
+
+    def test_falls_back_to_bluray_when_l5_is_unavailable(self):
+        monitor = self.make_monitor()
+
+        class FakeAddon:
+            def getSettingBool(self, name):
+                return name == "enable_autofit"
+
+        monitor.addon = FakeAddon()
+        monitor.get_player_id = lambda: 1
+        monitor._get_media_metadata = lambda: ("Example", "2020", False)
+        monitor._make_identity = lambda player_id, title, year: (player_id, "file", title, year)
+        monitor._reset_last_applied_view_mode = lambda player_id: None
+        monitor._read_l5_content_ar = lambda width, height: None
+        monitor.execute_json_rpc = lambda method, params: {
+            "currentvideostream": {"index": 0},
+            "videostreams": [{"index": 0, "width": 3840, "height": 2160}],
+        }
+        monitor._submit_lookup = Mock()
+
+        monitor._handle_av_started()
+
+        request = monitor._submit_lookup.call_args[0][0]
+        self.assertEqual(request["aspect_source"], monitor.BLURAY_ASPECT_SOURCE)
 
 
 if __name__ == "__main__":

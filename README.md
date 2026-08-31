@@ -8,9 +8,11 @@ When video starts, the service:
 
 1. Reads the current title, year, and active video stream from Kodi.
 2. Continues only for video containers close to 16:9.
-3. Looks up the title's original aspect ratio on [blu-ray.com](https://www.blu-ray.com).
-4. Calculates a zoom that is capped at the configured screen aspect ratio.
-5. Applies Kodi's custom zoom and pixel ratio on Kodi's service thread.
+3. For CoreELEC builds that expose Dolby Vision L5 metadata, validates three short
+   samples of the active-area offsets and derives the picture aspect ratio locally.
+4. Otherwise, looks up the title's original aspect ratio on [blu-ray.com](https://www.blu-ray.com).
+5. Calculates a zoom that is capped at the configured screen aspect ratio.
+6. Applies Kodi's custom zoom and pixel ratio on Kodi's service thread.
 
 Lookups run asynchronously, are cached for repeated playback, and are discarded if the player has already moved to another item. If the title, year, stream information, or online lookup is unavailable, the service leaves the current view unchanged.
 
@@ -19,9 +21,15 @@ Lookups run asynchronously, are cached for repeated playback, and are discarded 
 - Fully automatic background service.
 - Supports movies and TV episodes when Kodi exposes suitable title/year metadata. TV episodes are searched using the series title.
 - Uses the currently active video stream when multiple streams are present.
+- Uses validated CoreELEC Dolby Vision L5 active-area metadata before the online lookup when available.
 - Validates settings, stream dimensions, scraped URLs, scraped titles, and aspect-ratio values before using them.
 - Restores an auto-applied view mode when playback changes, but preserves a view mode changed manually afterwards.
 - Does not use a fallback aspect ratio when an online result is unavailable, avoiding unexpected cropping.
+
+The L5 path is optional and uses the `Player.Process(video.dovi.*)` InfoLabels supplied by
+CoreELEC Dolby Vision builds. Stock Kodi and builds without those labels continue through
+the blu-ray.com path. L5 can vary by shot or be temporarily rewritten for subtitles or the
+OSD; this service only accepts a stable startup value and does not attempt per-frame zooming.
 
 ## Installation
 

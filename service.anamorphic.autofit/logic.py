@@ -50,6 +50,43 @@ def aspect_ratio_from_dimensions(width, height):
     return width_number / height_number
 
 
+def parse_l5_offsets(left, right, top, bottom):
+    """Return non-negative integer L5 offsets, or ``None`` for bad metadata."""
+    parsed = []
+    for value in (left, right, top, bottom):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number < 0 or not number.is_integer():
+            return None
+        parsed.append(int(number))
+    return tuple(parsed)
+
+
+def aspect_ratio_from_l5_offsets(width, height, left, right, top, bottom):
+    """Return the active-picture aspect ratio described by Dolby Vision L5."""
+    width_number = _finite_positive(width)
+    height_number = _finite_positive(height)
+    offsets = parse_l5_offsets(left, right, top, bottom)
+    if (
+        width_number is None
+        or height_number is None
+        or offsets is None
+        or not width_number.is_integer()
+        or not height_number.is_integer()
+    ):
+        return None
+
+    active_width = width_number - offsets[0] - offsets[1]
+    active_height = height_number - offsets[2] - offsets[3]
+    if active_width <= 0 or active_height <= 0:
+        return None
+
+    aspect_ratio = active_width / active_height
+    return aspect_ratio if 1.0 <= aspect_ratio <= 4.0 else None
+
+
 def is_16_9_container(aspect_ratio):
     """Return whether an encoded video is close enough to a 16:9 container."""
     number = _finite_positive(aspect_ratio)

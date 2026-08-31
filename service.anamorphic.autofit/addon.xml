@@ -7,7 +7,7 @@
   <extension point="xbmc.service" library="service.py"/>
   <extension point="xbmc.addon.metadata">
     <summary lang="en_GB">Automatically adjusts zoom for anamorphic setups.</summary>
-    <description lang="en_GB">For users with a 16:9 projector, anamorphic lens, and widescreen display. When suitable 16:9 video is played, this service looks up the content aspect ratio, calculates a safe zoom, and sets the required pixel ratio. If metadata or the online lookup is unavailable, playback is left unchanged.</description>
+    <description lang="en_GB">For users with a 16:9 projector, anamorphic lens, and widescreen display. When suitable 16:9 video is played, this service uses validated Dolby Vision L5 metadata when available, otherwise looks up the content aspect ratio online, calculates a safe zoom, and sets the required pixel ratio. If metadata or the online lookup is unavailable, playback is left unchanged.</description>
     <platform>all</platform>
     <license>GPL-2.0-or-later</license>
     <source>https://github.com/floridoo/kodi-anamorphic-autofit</source>

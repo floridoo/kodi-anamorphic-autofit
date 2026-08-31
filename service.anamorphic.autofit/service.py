@@ -5,6 +5,7 @@ import json
 import math
 import queue
 import threading
+import time
 import traceback
 
 import xbmc
@@ -14,15 +15,29 @@ from aspect_provider import CACHE_MISS, BlurayAspectRatioProvider, make_lookup_k
 from logic import (
     DEFAULT_TARGET_AR,
     aspect_ratio_from_dimensions,
+    aspect_ratio_from_l5_offsets,
     calculate_view_mode,
     is_16_9_container,
     is_valid_target_ar,
+    parse_l5_offsets,
     parse_target_ar,
 )
 
 
 class AnamorphicPlayerMonitor(xbmc.Player):
     """Listen for playback events and apply a safe, reversible view mode."""
+
+    L5_SAMPLE_COUNT = 3
+    L5_SAMPLE_INTERVAL = 0.05
+    L5_ASPECT_SOURCE = "CoreELEC Dolby Vision L5"
+    BLURAY_ASPECT_SOURCE = "blu-ray.com"
+    L5_HAS_LABEL = "Player.Process(video.dovi.has.l5)"
+    L5_OFFSET_LABELS = (
+        "Player.Process(video.dovi.l5.left.offset)",
+        "Player.Process(video.dovi.l5.right.offset)",
+        "Player.Process(video.dovi.l5.top.offset)",
+        "Player.Process(video.dovi.l5.bottom.offset)",
+    )
 
     def __init__(self):
         super(AnamorphicPlayerMonitor, self).__init__()
@@ -125,6 +140,42 @@ class AnamorphicPlayerMonitor(xbmc.Player):
                     return stream
         return streams[0] if isinstance(streams[0], dict) else None
 
+    def _read_l5_sample(self, width, height):
+        """Read one validated CoreELEC L5 sample, if this build exposes it."""
+        if self._get_info_label(self.L5_HAS_LABEL) != "1":
+            return None
+
+        raw_offsets = [self._get_info_label(label) for label in self.L5_OFFSET_LABELS]
+        offsets = parse_l5_offsets(*raw_offsets)
+        if offsets is None:
+            return None
+
+        content_ar = aspect_ratio_from_l5_offsets(width, height, *offsets)
+        if content_ar is None:
+            return None
+        return offsets, content_ar
+
+    def _read_l5_content_ar(self, width, height):
+        """Return a stable L5 active-area result, or ``None`` if unavailable."""
+        samples = []
+        for index in range(self.L5_SAMPLE_COUNT):
+            samples.append(self._read_l5_sample(width, height))
+            if index + 1 < self.L5_SAMPLE_COUNT and self.L5_SAMPLE_INTERVAL > 0:
+                time.sleep(self.L5_SAMPLE_INTERVAL)
+
+        if not samples or any(sample is None for sample in samples):
+            return None
+
+        first_offsets, first_content_ar = samples[0]
+        if any(offsets != first_offsets for offsets, _content_ar in samples[1:]):
+            self.log(
+                "CoreELEC Dolby Vision L5 offsets changed during startup; "
+                "using the online aspect-ratio fallback.",
+                level=xbmc.LOGWARNING,
+            )
+            return None
+        return first_offsets, first_content_ar
+
     def _handle_av_started(self):
         self.log("onAVStarted event triggered. Analyzing video stream.")
         player_id = self.get_player_id()
@@ -148,13 +199,6 @@ class AnamorphicPlayerMonitor(xbmc.Player):
         if not self.addon.getSettingBool("enable_autofit"):
             self.log("Addon is disabled in settings. Skipping.")
             return
-        if not title or not year:
-            self.log(
-                "Title or year is missing; skipping online aspect-ratio lookup.",
-                level=xbmc.LOGWARNING,
-            )
-            return
-
         player_props = self.execute_json_rpc(
             "Player.GetProperties",
             {
@@ -189,12 +233,40 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             self.log("Video container is not 16:9. No adjustments needed.")
             return
 
+        l5_result = self._read_l5_content_ar(
+            video_stream.get("width"), video_stream.get("height")
+        )
         request = {
             "identity": identity,
             "title": title,
             "year": year,
             "video_ar": video_ar,
         }
+
+        if l5_result is not None:
+            l5_offsets, content_ar = l5_result
+            request.update(
+                {
+                    "aspect_source": self.L5_ASPECT_SOURCE,
+                    "l5_offsets": l5_offsets,
+                }
+            )
+            self.log(
+                f"Using {self.L5_ASPECT_SOURCE}: offsets="
+                f"{l5_offsets[0]}/{l5_offsets[1]}/{l5_offsets[2]}/{l5_offsets[3]}, "
+                f"content AR={content_ar:.3f}"
+            )
+            self._result_queue.put((request, content_ar))
+            return
+
+        if not title or not year:
+            self.log(
+                "Title or year is missing; skipping online aspect-ratio lookup.",
+                level=xbmc.LOGWARNING,
+            )
+            return
+
+        request["aspect_source"] = self.BLURAY_ASPECT_SOURCE
         self._submit_lookup(request)
 
     def onAVStarted(self):
@@ -266,7 +338,10 @@ class AnamorphicPlayerMonitor(xbmc.Player):
                 self.log("Discarding a stale aspect-ratio result.")
                 continue
             if content_ar is None:
-                self.log("Aspect-ratio lookup failed; leaving the current view unchanged.")
+                self.log(
+                    f"{request.get('aspect_source', self.BLURAY_ASPECT_SOURCE)} "
+                    "aspect-ratio lookup failed; leaving the current view unchanged."
+                )
                 continue
 
             view_mode = calculate_view_mode(
@@ -274,7 +349,9 @@ class AnamorphicPlayerMonitor(xbmc.Player):
             )
             if view_mode is None:
                 self.log(
-                    f"No adjustment needed for content AR ({content_ar:.3f}) and "
+                    f"No adjustment needed for "
+                    f"{request.get('aspect_source', self.BLURAY_ASPECT_SOURCE)} "
+                    f"content AR ({content_ar:.3f}) and "
                     f"container AR ({request['video_ar']:.3f})."
                 )
                 continue
@@ -283,7 +360,9 @@ class AnamorphicPlayerMonitor(xbmc.Player):
 
     def _apply_view_mode(self, request, content_ar, view_mode):
         self.log(
-            f"Applying anamorphic adjustment for content AR {content_ar:.3f}: "
+            f"Applying anamorphic adjustment from "
+            f"{request.get('aspect_source', self.BLURAY_ASPECT_SOURCE)} "
+            f"for content AR {content_ar:.3f}: "
             f"zoom={view_mode['zoom']:.3f}, pixelratio={view_mode['pixelratio']:.4f}"
         )
         # Player.SetViewMode targets Kodi's current video player and accepts
