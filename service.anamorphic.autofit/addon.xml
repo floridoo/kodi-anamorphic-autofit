@@ -1,16 +1,17 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="service.anamorphic.autofit" name="Anamorphic Auto Fit" version="1.0.0" provider-name="floridoo">
+<addon id="service.anamorphic.autofit" name="Anamorphic Auto Fit" version="1.1.0" provider-name="floridoo">
   <requires>
     <import addon="xbmc.python" version="3.0.0"/>
-    <import addon="script.module.requests" />
+    <import addon="script.module.requests"/>
   </requires>
-  <extension point="xbmc.python.script" library="service.py"/>
-  <extension point="xbmc.service" start="startup"/>
+  <extension point="xbmc.service" library="service.py"/>
   <extension point="xbmc.addon.metadata">
     <summary lang="en_GB">Automatically adjusts zoom for anamorphic setups.</summary>
-    <description lang="en_GB">For users with a 2.4:1 screen and anamorphic lens. When a 16:9 movie is played (letterboxed), this service automatically calculates the correct zoom to fill the screen width and sets the required pixel ratio to compensate for the lens.</description>
+    <description lang="en_GB">For users with a 16:9 projector, anamorphic lens, and widescreen display. When suitable 16:9 video is played, this service looks up the content aspect ratio, calculates a safe zoom, and sets the required pixel ratio. If metadata or the online lookup is unavailable, playback is left unchanged.</description>
     <platform>all</platform>
     <license>GPL-2.0-or-later</license>
+    <source>https://github.com/floridoo/kodi-anamorphic-autofit</source>
+    <news>1.1.0 - Added asynchronous lookup, caching, safer metadata/scraping, and reversible view-mode handling.</news>
     <assets>
       <icon>icon.png</icon>
     </assets>

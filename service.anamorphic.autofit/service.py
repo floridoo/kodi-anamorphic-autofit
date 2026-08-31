@@ -1,230 +1,404 @@
 # -*- coding: utf-8 -*-
-# Final version of the Anamorphic Auto Fit service addon.
-# This addon automatically adjusts the zoom and pixel ratio for anamorphic projector setups
-# by dynamically scraping the true aspect ratio of playing media.
+"""Kodi service that applies anamorphic zoom to suitable 16:9 video."""
+
+import json
+import math
+import queue
+import threading
+import traceback
 
 import xbmc
 import xbmcaddon
-import json
-import time
-import re
-import requests
+
+from aspect_provider import CACHE_MISS, BlurayAspectRatioProvider, make_lookup_key, normalize_year
+from logic import (
+    DEFAULT_TARGET_AR,
+    aspect_ratio_from_dimensions,
+    calculate_view_mode,
+    is_16_9_container,
+    is_valid_target_ar,
+    parse_target_ar,
+)
+
 
 class AnamorphicPlayerMonitor(xbmc.Player):
-    """
-    A custom Kodi Player class that listens for playback events and triggers
-    the anamorphic adjustment logic.
-    """
+    """Listen for playback events and apply a safe, reversible view mode."""
+
     def __init__(self):
         super(AnamorphicPlayerMonitor, self).__init__()
         self.addon = xbmcaddon.Addon()
-        self.session = requests.Session()
+        self.aspect_provider = BlurayAspectRatioProvider(logger=self.log)
+        self._result_queue = queue.Queue()
+        self._state_lock = threading.RLock()
+        self._current_identity = None
+        self._inflight = {}
+        self._shutdown = threading.Event()
+        self._last_applied_view_mode = None
         self.log("Service initialized")
 
     def log(self, msg, level=xbmc.LOGINFO):
-        """
-        A helper function for consistent and identifiable logging. All log messages
-        from this addon will be prefixed with '[service.anamorphic.autofit]'.
-        """
+        """Write consistently prefixed messages to Kodi's log."""
         xbmc.log(f"[service.anamorphic.autofit] {msg}", level=level)
 
     def execute_json_rpc(self, method, params):
-        """
-        A centralized wrapper for executing Kodi's JSON-RPC commands.
-        This handles the request creation, JSON conversion, and error logging
-        for all API interactions.
-        """
+        """Execute a JSON-RPC call and return its result, or ``None`` on error."""
         try:
             request = {
                 "jsonrpc": "2.0",
                 "method": method,
                 "params": params,
-                "id": 1
+                "id": 1,
             }
-            response_str = xbmc.executeJSONRPC(json.dumps(request))
-            response = json.loads(response_str)
+            response_text = xbmc.executeJSONRPC(json.dumps(request))
+            if not response_text:
+                self.log(f"Empty JSON-RPC response for {method}.", level=xbmc.LOGERROR)
+                return None
+            response = json.loads(response_text)
+            if not isinstance(response, dict):
+                self.log(f"Invalid JSON-RPC response for {method}.", level=xbmc.LOGERROR)
+                return None
             if "error" in response:
-                self.log(f"JSON-RPC Error on {method}: {response['error']}", level=xbmc.LOGERROR)
+                self.log(
+                    f"JSON-RPC error on {method}: {response['error']}",
+                    level=xbmc.LOGERROR,
+                )
                 return None
             return response.get("result")
-        except Exception as e:
-            self.log(f"Failed to execute JSON-RPC {method}: {e}", level=xbmc.LOGERROR)
-            return None
-
-    def _get_aspect_ratio_from_bluray_com(self, title, year):
-        """
-        Searches blu-ray.com and scrapes the aspect ratio. It uses an efficient
-        POST request and requires both a title and a year for accuracy.
-        """
-        if not title or not year:
-            self.log("Title or year is missing. Bailing out of web search for accuracy.", level=xbmc.LOGWARNING)
-            return None
-
-        search_term = f"{title} {year}"
-
-        # A User-Agent header is crucial to mimic a real web browser,
-        # preventing the server from blocking our automated request.
-        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15'}
-        self.session.headers.update(headers)
-
-        self.log(f"Attempting online search with term: '{search_term}'")
-        try:
-            # NON-OBVIOUS CHOICE: This uses a direct POST request to the search API,
-            # which returns a small, fast, and easy-to-parse JavaScript snippet
-            # instead of a full HTML page. This is much more efficient.
-            post_url = 'https://www.blu-ray.com/search/quicksearch.php'
-            post_data = {
-                'section': 'bluraymovies',
-                'userid': '-1',
-                'country': 'US',
-                'keyword': search_term
-            }
-            response = self.session.post(post_url, data=post_data, timeout=10)
-            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-            search_response = response.text
-
-            # NON-OBVIOUS CHOICE: We parse the raw JavaScript to find the first URL
-            # in the 'urls' array. This is more robust than parsing HTML tags.
-            # It looks for `var urls = new Array('...url...')` and captures the URL.
-            match = re.search(r"var urls = new Array\('([^']+)'", search_response)
-            if not match:
-                self.log(f"Could not parse JS URL array for search term: '{search_term}'.")
-                return None
-            
-            movie_url = match.group(1)
-            self.log(f"Found movie page link from JS response: {movie_url}")
-
-            # Now, fetch the content of the actual movie page.
-            response = self.session.get(movie_url, timeout=10)
-            response.raise_for_status()
-            movie_html = response.text
-
-            # This regex specifically looks for the "Aspect ratio: X.XX:1" text on the page.
-            ar_match = re.search(r'Aspect ratio:\s*(\d+\.\d{2}):1', movie_html)
-            if not ar_match:
-                self.log(f"Could not find 'Aspect ratio' tag for search term: '{search_term}'.")
-                return None
-
-            aspect_ratio = float(ar_match.group(1))
-            self.log(f"Successfully scraped aspect ratio: {aspect_ratio}")
-            return aspect_ratio # Success! Exit the function with the result.
-
-        except requests.exceptions.RequestException as e:
-            self.log(f"A network error occurred during web scraping for '{search_term}': {e}", level=xbmc.LOGERROR)
-        except Exception as e:
-            self.log(f"An unexpected error occurred during web scraping for '{search_term}': {e}", level=xbmc.LOGERROR)
-        
-        self.log(f"Search attempt failed for '{search_term}'.")
+        except (TypeError, ValueError) as error:
+            self.log(f"Invalid JSON-RPC response for {method}: {error}", level=xbmc.LOGERROR)
+        except Exception as error:
+            self.log(f"Failed to execute JSON-RPC {method}: {error}", level=xbmc.LOGERROR)
         return None
-    
-    def onAVStarted(self):
-        """
-        The main logic function.
-        NON-OBVIOUS CHOICE: This is triggered by onAVStarted, not onPlayBackStarted.
-        onAVStarted fires when the first video frame is rendered, which guarantees
-        that the player is fully initialized and video stream details are available.
-        This completely eliminates timing issues and the need for unreliable retry loops.
-        """
-        self.log("onAVStarted event triggered. Analyzing video stream.")
 
-        if not self.addon.getSettingBool('enable_autofit'):
+    def _get_info_label(self, label):
+        try:
+            return (xbmc.getInfoLabel(label) or "").strip()
+        except Exception as error:
+            self.log(f"Could not read InfoLabel {label}: {error}", level=xbmc.LOGWARNING)
+            return ""
+
+    def _get_media_metadata(self):
+        show_title = self._get_info_label("VideoPlayer.TVShowTitle")
+        title = (
+            show_title
+            or self._get_info_label("VideoPlayer.Title")
+            or self._get_info_label("Player.Title")
+            or self._get_info_label("VideoPlayer.OriginalTitle")
+        )
+        raw_year = self._get_info_label("VideoPlayer.Year") or self._get_info_label(
+            "VideoPlayer.Premiered"
+        )
+        year = normalize_year(raw_year)
+        return title, year, bool(show_title)
+
+    def _get_target_ar(self):
+        raw_value = self.addon.getSetting("target_ar")
+        if not is_valid_target_ar(raw_value):
+            self.log(
+                f"Invalid target_ar setting {raw_value!r}; using default {DEFAULT_TARGET_AR:.2f}.",
+                level=xbmc.LOGWARNING,
+            )
+        return parse_target_ar(raw_value)
+
+    def _playing_file(self):
+        try:
+            return self.getPlayingFile() or ""
+        except Exception:
+            return ""
+
+    def _make_identity(self, player_id, title, year):
+        return (player_id, self._playing_file(), title, year)
+
+    def _select_video_stream(self, player_props):
+        streams = player_props.get("videostreams") or []
+        if not isinstance(streams, list) or not streams:
+            return None
+
+        current = player_props.get("currentvideostream") or {}
+        current_index = current.get("index") if isinstance(current, dict) else None
+        if current_index is not None:
+            for stream in streams:
+                if not isinstance(stream, dict):
+                    continue
+                stream_index = stream.get("index")
+                if stream_index == current_index or str(stream_index) == str(current_index):
+                    return stream
+        return streams[0] if isinstance(streams[0], dict) else None
+
+    def _handle_av_started(self):
+        self.log("onAVStarted event triggered. Analyzing video stream.")
+        player_id = self.get_player_id()
+        if player_id is None:
+            return
+
+        title, year, is_tv_show = self._get_media_metadata()
+        identity = self._make_identity(player_id, title, year)
+        with self._state_lock:
+            previous_identity = self._current_identity
+            self._current_identity = identity
+
+        if previous_identity != identity:
+            self._reset_last_applied_view_mode(player_id)
+
+        self.log(
+            f"Media identified via InfoLabels: Title='{title}', Year='{year}', "
+            f"IsTVShow={is_tv_show}"
+        )
+
+        if not self.addon.getSettingBool("enable_autofit"):
             self.log("Addon is disabled in settings. Skipping.")
             return
-            
-        try:
-            target_ar_str = self.addon.getSetting('target_ar')
-            TARGET_SCREEN_AR = float(target_ar_str)
-            self.log(f"Using Target Screen AR from settings: {TARGET_SCREEN_AR}")
-        except (ValueError, TypeError):
-            TARGET_SCREEN_AR = 2.40
-            self.log(f"Could not parse Target AR setting. Falling back to default: {TARGET_SCREEN_AR}", level=xbmc.LOGWARNING)
+        if not title or not year:
+            self.log(
+                "Title or year is missing; skipping online aspect-ratio lookup.",
+                level=xbmc.LOGWARNING,
+            )
+            return
 
-        # --- UNIVERSAL METADATA LOGIC (InfoLabels) ---
-        # NON-OBVIOUS CHOICE: This is the most robust method. We read the same InfoLabels
-        # that the skin uses. By the time onAVStarted fires, Kodi's player state has
-        # been updated by any running metadata addons, making this data accurate.
-        is_tv_show = bool(xbmc.getInfoLabel('VideoPlayer.TVShowTitle'))
-        search_title = xbmc.getInfoLabel('VideoPlayer.TVShowTitle') or xbmc.getInfoLabel('Player.Title')
-        year = xbmc.getInfoLabel('VideoPlayer.Year')
-
-        self.log(f"Media identified via InfoLabels: Title='{search_title}', Year='{year}', IsTVShow={is_tv_show}")
-        
-        player_id = self.get_player_id()
-        if player_id is None: return
-
-        # Get video stream properties to check the container aspect ratio.
-        player_props = self.execute_json_rpc("Player.GetProperties", {"playerid": player_id, "properties": ["videostreams"]})
-        if not (player_props and player_props.get("videostreams")):
+        player_props = self.execute_json_rpc(
+            "Player.GetProperties",
+            {
+                "playerid": player_id,
+                "properties": ["currentvideostream", "videostreams"],
+            },
+        )
+        if not isinstance(player_props, dict):
             self.log("Could not retrieve video stream details. Aborting.", level=xbmc.LOGWARNING)
             return
 
-        video_stream = player_props["videostreams"][0]
-        width, height = video_stream.get("width"), video_stream.get("height")
-
-        if not width or not height:
-            self.log("Video stream width or height is missing. Aborting.", level=xbmc.LOGWARNING)
+        video_stream = self._select_video_stream(player_props)
+        if video_stream is None:
+            self.log("No video stream was available. Aborting.", level=xbmc.LOGWARNING)
             return
 
-        video_ar = float(width) / float(height)
-        self.log(f"Video resolution: {width}x{height}, Container AR: {video_ar:.3f}")
-
-        # --- Early Exit Optimization ---
-        if not (1.77 < video_ar < 1.79):
-            self.log("Video container is not 16:9. No adjustments needed. Bailing out early.")
+        video_ar = aspect_ratio_from_dimensions(
+            video_stream.get("width"), video_stream.get("height")
+        )
+        if video_ar is None:
+            self.log(
+                "Video stream width or height is invalid. Aborting.",
+                level=xbmc.LOGWARNING,
+            )
             return
 
-        content_ar = self._get_aspect_ratio_from_bluray_com(search_title, year)
-
-        # If scraping fails, bail out. No fallback is used.
-        if not content_ar:
-            self.log("Could not scrape aspect ratio, and no fallback is configured. No adjustments will be made.")
+        self.log(
+            f"Video resolution: {video_stream.get('width')}x{video_stream.get('height')}, "
+            f"Container AR: {video_ar:.3f}"
+        )
+        if not is_16_9_container(video_ar):
+            self.log("Video container is not 16:9. No adjustments needed.")
             return
 
-        # The final trigger condition.
-        if content_ar > video_ar + 0.01:
-            self.log("16:9 container with wider content detected. Applying anamorphic adjustments.")
-            
-            # --- CRITICAL FIX: The Smart Zoom Calculation ---
-            effective_ar = min(content_ar, TARGET_SCREEN_AR)
-            self.log(f"Using effective AR for zoom: {effective_ar:.3f} (min of Content AR {content_ar:.3f} and Screen AR {TARGET_SCREEN_AR:.3f})")
-            
-            zoom_factor = effective_ar / video_ar
-            ANAMORPHIC_PIXEL_RATIO = (16.0 / 9.0) / TARGET_SCREEN_AR
+        request = {
+            "identity": identity,
+            "title": title,
+            "year": year,
+            "video_ar": video_ar,
+        }
+        self._submit_lookup(request)
 
-            self.log(f"Calculated Zoom Factor: {zoom_factor:.3f}")
-            self.log(f"Applying Pixel Ratio: {ANAMORPHIC_PIXEL_RATIO:.4f}")
+    def onAVStarted(self):
+        """Start an asynchronous lookup after Kodi has initialized the stream."""
+        try:
+            self._handle_av_started()
+        except Exception:
+            self.log(
+                "Unhandled error while processing onAVStarted:\n"
+                + traceback.format_exc(),
+                level=xbmc.LOGERROR,
+            )
 
-            view_mode_params = {"viewmode": {"zoom": zoom_factor, "pixelratio": ANAMORPHIC_PIXEL_RATIO}}
-            self.execute_json_rpc("Player.SetViewMode", view_mode_params)
-            self.log("Custom view mode applied successfully.")
-        else:
-            self.log(f"No adjustment needed. Content AR ({content_ar:.3f}) is not wider than Container AR ({video_ar:.3f}).")
+    def _submit_lookup(self, request):
+        key = make_lookup_key(request["title"], request["year"])
+        cached = self.aspect_provider.get_cached(request["title"], request["year"])
+        if cached is not CACHE_MISS:
+            self._result_queue.put((request, cached))
+            return
+
+        with self._state_lock:
+            pending = self._inflight.get(key)
+            if pending is not None:
+                pending.append(request)
+                return
+            self._inflight[key] = [request]
+
+        worker = threading.Thread(
+            target=self._lookup_worker,
+            args=(key, request["title"], request["year"]),
+            name="anamorphic-aspect-lookup",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except Exception:
+            with self._state_lock:
+                self._inflight.pop(key, None)
+            self.log("Could not start aspect-ratio lookup worker.", level=xbmc.LOGERROR)
+
+    def _lookup_worker(self, key, title, year):
+        try:
+            content_ar = self.aspect_provider.lookup(
+                title, year, abort_event=self._shutdown
+            )
+        except Exception:
+            content_ar = None
+            self.log(
+                "Unhandled error in aspect-ratio lookup:\n" + traceback.format_exc(),
+                level=xbmc.LOGERROR,
+            )
+
+        with self._state_lock:
+            requests = self._inflight.pop(key, [])
+        for request in requests:
+            self._result_queue.put((request, content_ar))
+
+    def process_results(self):
+        """Apply completed lookup results on the Kodi service thread."""
+        while True:
+            try:
+                request, content_ar = self._result_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            with self._state_lock:
+                is_current = request["identity"] == self._current_identity
+            if not is_current:
+                self.log("Discarding a stale aspect-ratio result.")
+                continue
+            if content_ar is None:
+                self.log("Aspect-ratio lookup failed; leaving the current view unchanged.")
+                continue
+
+            view_mode = calculate_view_mode(
+                request["video_ar"], content_ar, self._get_target_ar()
+            )
+            if view_mode is None:
+                self.log(
+                    f"No adjustment needed for content AR ({content_ar:.3f}) and "
+                    f"container AR ({request['video_ar']:.3f})."
+                )
+                continue
+
+            self._apply_view_mode(request, content_ar, view_mode)
+
+    def _apply_view_mode(self, request, content_ar, view_mode):
+        self.log(
+            f"Applying anamorphic adjustment for content AR {content_ar:.3f}: "
+            f"zoom={view_mode['zoom']:.3f}, pixelratio={view_mode['pixelratio']:.4f}"
+        )
+        # Player.SetViewMode targets Kodi's current video player and accepts
+        # only the viewmode object; unlike most Player methods, it has no
+        # playerid parameter.
+        result = self.execute_json_rpc(
+            "Player.SetViewMode",
+            {"viewmode": view_mode},
+        )
+        if result is None:
+            self.log("Kodi rejected the custom view mode.", level=xbmc.LOGERROR)
+            return
+
+        with self._state_lock:
+            if request["identity"] == self._current_identity:
+                self._last_applied_view_mode = {
+                    "player_id": request["identity"][0],
+                    "identity": request["identity"],
+                    "viewmode": dict(view_mode),
+                }
+        self.log("Custom view mode applied successfully.")
+
+    @staticmethod
+    def _same_view_mode(actual, expected):
+        if not isinstance(actual, dict) or not isinstance(expected, dict):
+            return False
+        try:
+            return math.isclose(
+                float(actual.get("zoom")),
+                float(expected["zoom"]),
+                rel_tol=1e-4,
+                abs_tol=1e-4,
+            ) and math.isclose(
+                float(actual.get("pixelratio")),
+                float(expected["pixelratio"]),
+                rel_tol=1e-4,
+                abs_tol=1e-4,
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def _reset_last_applied_view_mode(self, player_id):
+        with self._state_lock:
+            applied = self._last_applied_view_mode
+        if not applied or applied["player_id"] != player_id:
+            return
+
+        # Player.GetViewMode likewise has no parameters in Kodi's JSON-RPC API.
+        current = self.execute_json_rpc("Player.GetViewMode", {})
+        if current is None:
+            return
+        if not self._same_view_mode(current, applied["viewmode"]):
+            with self._state_lock:
+                if self._last_applied_view_mode is applied:
+                    self._last_applied_view_mode = None
+            self.log("Keeping the current view mode because it changed after auto-fit.")
+            return
+
+        result = self.execute_json_rpc(
+            "Player.SetViewMode",
+            {"viewmode": "normal"},
+        )
+        if result is None:
+            self.log("Could not restore Kodi's normal view mode.", level=xbmc.LOGWARNING)
+            return
+
+        with self._state_lock:
+            if self._last_applied_view_mode is applied:
+                self._last_applied_view_mode = None
+        self.log("Restored Kodi's normal view mode after auto-fit.")
 
     def onPlayBackStopped(self):
-        self.log("Playback stopped.")
-        pass
+        try:
+            self.log("Playback stopped.")
+            player_id = self.get_player_id(log_missing=False)
+            if player_id is not None:
+                self._reset_last_applied_view_mode(player_id)
+            with self._state_lock:
+                self._current_identity = None
+        except Exception:
+            self.log(
+                "Unhandled error while processing playback stop:\n" + traceback.format_exc(),
+                level=xbmc.LOGERROR,
+            )
 
     def onPlayBackEnded(self):
         self.onPlayBackStopped()
 
-    def get_player_id(self):
-        """Finds the active video player ID."""
+    def get_player_id(self, log_missing=True):
+        """Return the active video player ID, if Kodi has one."""
         players = self.execute_json_rpc("Player.GetActivePlayers", {})
-        if players:
+        if isinstance(players, list):
             for player in players:
-                if player["type"] == "video":
-                    return player["playerid"]
-        self.log("No active video player found.", level=xbmc.LOGWARNING)
+                if isinstance(player, dict) and player.get("type") == "video":
+                    player_id = player.get("playerid")
+                    if player_id is not None:
+                        return player_id
+        if log_missing:
+            self.log("No active video player found.", level=xbmc.LOGWARNING)
         return None
 
-if __name__ == '__main__':
+    def shutdown(self):
+        """Stop new lookups; already-running requests are allowed to finish safely."""
+        self._shutdown.set()
+        with self._state_lock:
+            self._current_identity = None
+
+
+if __name__ == "__main__":
     player_monitor = AnamorphicPlayerMonitor()
-    
-    # The monitor loop's only job is to keep the addon running.
-    # All logic is now handled by the event-driven Player class.
     monitor = xbmc.Monitor()
-    while not monitor.abortRequested():
-        if monitor.waitForAbort(10):
-            break
-            
-    del player_monitor
+    try:
+        while not monitor.abortRequested():
+            player_monitor.process_results()
+            if monitor.waitForAbort(0.25):
+                break
+    finally:
+        player_monitor.shutdown()
